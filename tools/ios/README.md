@@ -4,15 +4,15 @@ This target compiles WindowSmash as an arm64 iOS app with SDL3 and the Metal ren
 
 ## Private build flow
 
-The public GitHub repository contains source and build scripts only. A one-time authenticated transfer sends generated recompilation C, manifests, and relocatable module images to the macOS runner. The runner returns an unsigned app bundle directly to the owner's computer; the workflow does not create a GitHub artifact or release. The owner's prepared ROMFS and NCA files are read locally by `package_ipa.py` and streamed into the final IPA. Original NSPs and keys are not used by this packaging step.
+The public GitHub repository contains source and build scripts only. A one-time authenticated transfer sends generated recompilation C, manifests, and relocatable module images to the macOS runner. The runner returns an unsigned app bundle directly to the owner's computer; the workflow does not create a GitHub artifact or release. The owner's prepared ROMFS and NCA files stay local. `package_ipa.py` makes a small IPA and a separate ZIP for those files; no game data is sent to GitHub or included in the IPA.
 
 The scripts are:
 
 - `transfer.py`: prepare and serve the private compiler input, then receive the app bundle.
 - `build_ios.py`: cross-compile the generated game and runtime for iOS arm64.
-- `package_ipa.py`: create and verify a Zip64 IPA from the app bundle and local `dump/` folder.
+- `package_ipa.py`: create and verify a small Zip64 IPA plus a separate game-data ZIP from the app bundle and local `dump/` folder.
 
-The final app bundle must be signed with the owner's Apple signing certificate before device installation. The IPA includes the prepared game data when `package_ipa.py` receives the local `dump/` folder. The uncompressed assets are about 18.4 GB for the current 13.0.5 preparation, so this is intended for private sideloading and needs installation validation on the target devices.
+The final IPA must be signed with the owner's Apple signing certificate before device installation. Install the small IPA, transfer the game-data ZIP to the iPad, and open it in Files to extract it. Launch the app and tap **Choose dump folder**. Select the extracted top-level `dump` folder (the one containing `modules`). The app copies the required files into its Documents folder, shows copy progress, and starts the game when the import is complete. Keep the app open and leave the folder names unchanged. Keep the game-data ZIP private; it contains the user's game files and is never uploaded by the build workflow.
 
 ## Controllers
 

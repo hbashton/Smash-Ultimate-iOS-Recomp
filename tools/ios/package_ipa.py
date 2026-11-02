@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Create a private iOS IPA from a built app and the owner's prepared game data.
+"""Create a small private iOS IPA and a separate archive from the owner's prepared game data.
 
-Game assets are streamed straight from the local prepared folder into a Zip64 archive. They are
-not copied into the checkout, added to Git, or sent to the macOS runner.
+Game assets are streamed straight from the local prepared folder into a separate Zip64 archive.
+They are not copied into the checkout, added to Git, included in the IPA, or sent to the macOS runner.
 """
 from __future__ import annotations
 
@@ -45,14 +45,14 @@ def required_romfs_files(module_dir: Path) -> set[str]:
     return required
 
 
-def packaged_assets(game_data: Path, app: Path) -> dict[str, Path]:
+def separate_game_data(game_data: Path, app: Path) -> dict[str, Path]:
     source_modules = game_data / "modules"
     required = required_romfs_files(source_modules)
     inputs: dict[str, Path] = {}
     for name in required | COPYABLE_MODULES:
         source = source_modules / name
         if source.is_file():
-            inputs[f"Resources/dump/modules/{name}"] = source
+            inputs[f"dump/modules/{name}"] = source
     source_relocs = {source.name for source in source_modules.glob("*.reloc.bin")}
     bundled_relocs = {source.name for source in (app / "Resources" / "dump" / "modules").glob("*.reloc.bin")}
     if not source_relocs or source_relocs != bundled_relocs:
@@ -67,7 +67,7 @@ def packaged_assets(game_data: Path, app: Path) -> dict[str, Path]:
     if fonts.is_dir():
         for source in fonts.iterdir():
             if source.is_file() and source.suffix.lower() == ".bfttf":
-                inputs[f"Resources/dump/fonts/{source.name}"] = source
+                inputs[f"dump/fonts/{source.name}"] = source
     return inputs
 
 
@@ -79,26 +79,63 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def app_files(app: Path, overrides: dict[str, Path]):
-    """Yield the app bundle's files, with game data read directly from its private source folder."""
-    overridden = set(overrides)
+def keep_in_ipa(relative: str) -> bool:
+    """Keep compiled module images; store owner game assets in the separate import archive."""
+    parts = relative.split("/")
+    if parts[:3] == ["Resources", "dump", "fonts"]:
+        return False
+    if parts[:3] == ["Resources", "dump", "modules"] and len(parts) > 3:
+        return parts[3].endswith(".reloc.bin")
+    return True
+
+
+def app_files(app: Path):
+    """Yield only app/runtime files, excluding game content even from an older full bundle."""
     for base, dirs, names in os.walk(app, topdown=True, followlinks=False):
         dirs[:] = sorted(dirs)
         base_path = Path(base)
         for name in list(dirs):
             source = base_path / name
             relative = source.relative_to(app).as_posix()
-            if source.is_symlink():
+            if source.is_symlink() and keep_in_ipa(relative):
                 dirs.remove(name)
-                if relative not in overridden:
-                    yield relative, source
+                yield relative, source
         for name in sorted(names):
             source = base_path / name
             relative = source.relative_to(app).as_posix()
-            if relative not in overridden:
+            if keep_in_ipa(relative):
                 yield relative, source
-    for relative, source in sorted(overrides.items()):
-        yield relative, source
+
+
+def write_game_data_archive(output: Path, files: dict[str, Path]) -> None:
+    partial = output.with_suffix(output.suffix + ".partial")
+    partial.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(partial, "w", allowZip64=True) as zf:
+            zf.writestr("dump/", b"")
+            zf.writestr("dump/modules/", b"")
+            if any(name.startswith("dump/fonts/") for name in files):
+                zf.writestr("dump/fonts/", b"")
+            for name, source in sorted(files.items()):
+                zip_file(zf, name, source)
+            zf.writestr("README.txt", (
+                "Super Smash Bros. Ultimate 13.0.5 game data\n\n"
+                "The small IPA does not contain the game files. Transfer this ZIP to the iPad and "
+                "extract it in Files. Launch the app and tap Choose dump folder. Select the extracted "
+                "top-level dump folder (the one containing modules). The app copies the files into "
+                "its Documents folder and starts the game when the import is complete. Keep the app "
+                "open and leave the folder names unchanged.\n"
+            ).encode("utf-8"))
+        with zipfile.ZipFile(partial, "r") as zf:
+            bad = zf.testzip()
+            if bad:
+                raise OSError(f"game-data archive checksum failed: {bad}")
+            if "dump/modules/romfs.cfg" not in zf.namelist():
+                raise OSError("game-data archive is missing dump/modules/romfs.cfg")
+        os.replace(partial, output)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def zip_file(zf: zipfile.ZipFile, archive_name: str, source: Path) -> tuple[int, int]:
@@ -155,17 +192,22 @@ def main() -> int:
     parser.add_argument("--app", required=True, type=Path, help="built WindowSmash.app directory")
     parser.add_argument("--game-data", required=True, type=Path, help="owner's prepared dump directory (contains modules/ and optionally fonts/)")
     parser.add_argument("--out", required=True, type=Path, help="destination IPA")
+    parser.add_argument("--game-data-out", required=True, type=Path, help="separate ZIP for importing game data from Files")
     args = parser.parse_args()
     app = args.app.resolve()
     game_data = args.game_data.resolve()
     output = args.out.resolve()
+    game_output = args.game_data_out.resolve()
     if not app.is_dir() or not game_data.is_dir():
         raise SystemExit("app and prepared game-data directories must exist")
+    if output == game_output:
+        raise SystemExit("the IPA and game-data archive must have different output paths")
     verify_bundle(app)
-    overrides = packaged_assets(game_data, app)
-    if output.exists():
-        raise SystemExit(f"output already exists; choose a new IPA filename: {output}")
+    data_files = separate_game_data(game_data, app)
+    if output.exists() or game_output.exists():
+        raise SystemExit("an output already exists; choose new filenames for both files")
     output.parent.mkdir(parents=True, exist_ok=True)
+    game_output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial")
     partial.unlink(missing_ok=True)
     total = 0
@@ -174,7 +216,7 @@ def main() -> int:
         with zipfile.ZipFile(partial, "w", allowZip64=True) as zf:
             zf.writestr("Payload/", b"")
             zf.writestr("Payload/WindowSmash.app/", b"")
-            files = list(app_files(app, overrides))
+            files = list(app_files(app))
             for index, (relative, source) in enumerate(files, 1):
                 size, crc = zip_file(zf, f"Payload/WindowSmash.app/{relative}", source)
                 source_crc[f"Payload/WindowSmash.app/{relative}"] = (size, crc)
@@ -192,11 +234,19 @@ def main() -> int:
             info = plistlib.loads(zf.read("Payload/WindowSmash.app/Info.plist"))
             if info.get("GCSupportsControllerUserInteraction") is not True:
                 raise OSError("controller capability was lost from the packaged IPA")
+            bundled_user_data = [name for name in zf.namelist()
+                                 if name.startswith("Payload/WindowSmash.app/Resources/dump/")
+                                 and "/modules/" in name and not name.endswith(".reloc.bin")]
+            if bundled_user_data:
+                raise OSError("game data was unexpectedly included in the small IPA")
+        write_game_data_archive(game_output, data_files)
         os.replace(partial, output)
     except Exception:
         partial.unlink(missing_ok=True)
+        game_output.unlink(missing_ok=True)
         raise
-    print(f"IPA ready: {output} ({output.stat().st_size / 1_000_000_000:.2f} GB; unsigned; private game assets included)", flush=True)
+    print(f"Small IPA ready: {output} ({output.stat().st_size / 1_000_000_000:.2f} GB; unsigned)", flush=True)
+    print(f"Game data ready: {game_output} ({game_output.stat().st_size / 1_000_000_000:.2f} GB; never sent to the build runner)", flush=True)
     return 0
 
 

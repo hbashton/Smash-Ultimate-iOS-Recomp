@@ -5,12 +5,20 @@
  * pumping lifecycle and input events. */
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <SDL3/SDL.h>
 #import <SDL3/SDL_metal.h>
 #import <SDL3/SDL_system.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "../display.h"
 
@@ -30,6 +38,20 @@ static UIWindow *ui_window;
 static volatile int focused = 1;
 static const bool *keys;
 static int nkeys;
+static atomic_int ssbu_import_in_progress = 0;
+
+@interface SSGameDataImportCoordinator : NSObject <UIDocumentPickerDelegate>
+@property(nonatomic, weak) UIViewController *presenter;
+@property(nonatomic, strong) UIAlertController *progressAlert;
+@property(atomic) BOOL cancelled;
+@property(atomic) unsigned long long completedBytes;
+@property(atomic) unsigned long long totalBytes;
+- (void)presentPicker;
+- (void)refreshProgress;
+- (void)showImportError:(NSError *)error;
+@end
+
+static SSGameDataImportCoordinator *ssbu_import_coordinator;
 
 /* ---- the guest-visible keyboard ------------------------------------------------------------ */
 static SDL_Scancode scancode_of(int vk) {
@@ -80,6 +102,17 @@ static NSString *module_directory(void) {
     return [[urls[0] path] stringByAppendingPathComponent:@"dump/modules"];
 }
 
+static NSString *documents_directory(void) {
+    NSArray<NSURL *> *urls = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+                                                                      inDomains:NSUserDomainMask];
+    return urls.count ? urls[0].path : nil;
+}
+
+static NSString *game_data_import_marker(void) {
+    NSString *documents = documents_directory();
+    return documents ? [documents stringByAppendingPathComponent:@".ssbu-game-data-import-in-progress"] : nil;
+}
+
 static NSString *bundled_module_directory(void) {
     return [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"dump/modules"];
 }
@@ -92,6 +125,9 @@ static NSString *leaf_name(NSString *path) {
 /* Keep the small config writable in Documents, while the large game images stay in the app bundle.
  * A user-imported copy in Documents takes precedence when present. */
 static BOOL rebase_romfs_config(void) {
+    NSString *marker = game_data_import_marker();
+    if (atomic_load_explicit(&ssbu_import_in_progress, memory_order_acquire) ||
+        (marker && [[NSFileManager defaultManager] fileExistsAtPath:marker])) return NO;
     NSString *dir = module_directory();
     if (!dir) return NO;
     NSString *cfg = [dir stringByAppendingPathComponent:@"romfs.cfg"];
@@ -207,12 +243,389 @@ int rt_ios_prepare_data(char *out, size_t cap) {
 
 int rt_ios_game_data_ready(void) { return rebase_romfs_config(); }
 
-void rt_window_ios_show_import_help(void) {
+@interface SSGameDataImportFile : NSObject
+@property(nonatomic, strong) NSURL *url;
+@property(nonatomic, copy) NSString *relativePath;
+@property(nonatomic) unsigned long long size;
+@end
+
+@implementation SSGameDataImportFile
+@end
+
+static NSError *ssbu_import_error(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"SSBUGameDataImport" code:code
+                           userInfo:@{ NSLocalizedDescriptionKey: message ?: @"The import could not be completed." }];
+}
+
+static NSURL *ssbu_modules_folder(NSURL *selected) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSURL *> *candidates = [NSMutableArray array];
+    if ([[selected.lastPathComponent lowercaseString] isEqualToString:@"modules"])
+        [candidates addObject:selected];
+    [candidates addObject:[selected URLByAppendingPathComponent:@"modules" isDirectory:YES]];
+    [candidates addObject:[[selected URLByAppendingPathComponent:@"dump" isDirectory:YES]
+                           URLByAppendingPathComponent:@"modules" isDirectory:YES]];
+    for (NSURL *candidate in candidates) {
+        NSString *cfg = [[candidate path] stringByAppendingPathComponent:@"romfs.cfg"];
+        if ([fm fileExistsAtPath:cfg]) return candidate;
+    }
+    return nil;
+}
+
+static NSArray<SSGameDataImportFile *> *ssbu_import_files(NSURL *modules, unsigned long long *total,
+                                                           NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<SSGameDataImportFile *> *files = [NSMutableArray array];
+    __block NSError *enumerationError = nil;
+    NSDirectoryEnumerator<NSURL *> *enumerator = [fm enumeratorAtURL:modules
+        includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey, NSURLFileSizeKey]
+        options:NSDirectoryEnumerationSkipsHiddenFiles
+        errorHandler:^BOOL(NSURL *url, NSError *itemError) {
+            (void)url;
+            enumerationError = itemError;
+            return NO;
+        }];
+    if (!enumerator) {
+        if (error) *error = ssbu_import_error(1, @"Files could not read that folder. Choose the extracted dump folder again.");
+        return nil;
+    }
+    NSString *prefix = [[modules path] stringByAppendingString:@"/"];
+    unsigned long long byteCount = 0;
+    for (NSURL *url in enumerator) {
+        NSNumber *isRegular = nil, *isDirectory = nil, *isSymlink = nil;
+        NSError *resourceError = nil;
+        [url getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:&resourceError];
+        [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+        [url getResourceValue:&isSymlink forKey:NSURLIsSymbolicLinkKey error:nil];
+        if (resourceError) { enumerationError = resourceError; break; }
+        if (isSymlink.boolValue || isDirectory.boolValue || !isRegular.boolValue) continue;
+        if ([url.lastPathComponent hasSuffix:@".reloc.bin"]) continue; /* Keep the app's compiled modules. */
+        if (![url.path hasPrefix:prefix]) {
+            enumerationError = ssbu_import_error(2, @"A file in the selected folder has an invalid path.");
+            break;
+        }
+        NSString *relative = [url.path substringFromIndex:prefix.length];
+        BOOL safe = relative.length > 0;
+        for (NSString *component in relative.pathComponents)
+            if ([component isEqualToString:@"."] || [component isEqualToString:@".."] ||
+                [component containsString:@"\\"] || [component containsString:@"/"]) safe = NO;
+        if (!safe) {
+            enumerationError = ssbu_import_error(3, @"A file in the selected folder has an invalid name.");
+            break;
+        }
+        NSDictionary *attributes = [fm attributesOfItemAtPath:url.path error:&resourceError];
+        if (!attributes || resourceError || ![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
+            enumerationError = resourceError ?: ssbu_import_error(4, @"A game-data file could not be read.");
+            break;
+        }
+        unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+        if (ULLONG_MAX - byteCount < size) {
+            enumerationError = ssbu_import_error(5, @"The selected folder is too large to import.");
+            break;
+        }
+        SSGameDataImportFile *item = [SSGameDataImportFile new];
+        item.url = url;
+        item.relativePath = relative;
+        item.size = size;
+        [files addObject:item];
+        byteCount += size;
+    }
+    if (enumerationError) {
+        if (error) *error = enumerationError;
+        return nil;
+    }
+    BOOL hasConfig = NO;
+    for (SSGameDataImportFile *file in files)
+        if ([file.relativePath isEqualToString:@"romfs.cfg"]) { hasConfig = YES; break; }
+    if (!hasConfig || files.count < 2 || !byteCount) {
+        if (error) *error = ssbu_import_error(6, @"That folder is missing the game files. Choose the extracted dump folder that contains modules/romfs.cfg.");
+        return nil;
+    }
+    [files sortUsingComparator:^NSComparisonResult(SSGameDataImportFile *a, SSGameDataImportFile *b) {
+        return [a.relativePath compare:b.relativePath options:NSLiteralSearch];
+    }];
+    if (total) *total = byteCount;
+    return files;
+}
+
+static BOOL ssbu_copy_import_file(SSGameDataImportFile *file, NSString *destination,
+                                  SSGameDataImportCoordinator *coordinator, NSError **error) {
+    NSString *parent = [destination stringByDeletingLastPathComponent];
+    NSError *directoryError = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:parent withIntermediateDirectories:YES
+                                                     attributes:nil error:&directoryError]) {
+        if (error) *error = directoryError;
+        return NO;
+    }
+    NSString *temporary = [parent stringByAppendingPathComponent:
+        [NSString stringWithFormat:@".%@.ssbu-importing", NSUUID.UUID.UUIDString]];
+    int input = open(file.url.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW);
+    if (input < 0) {
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno
+            userInfo:@{NSFilePathErrorKey: file.url.path ?: @""}];
+        return NO;
+    }
+    struct stat sourceStat;
+    int statResult = fstat(input, &sourceStat);
+    if (statResult != 0 || !S_ISREG(sourceStat.st_mode) ||
+        (unsigned long long)sourceStat.st_size != file.size) {
+        int saved = statResult != 0 ? errno : EIO;
+        close(input);
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+            userInfo:@{NSFilePathErrorKey: file.url.path ?: @""}];
+        return NO;
+    }
+    int output = open(temporary.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (output < 0) {
+        int saved = errno;
+        close(input);
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+            userInfo:@{NSFilePathErrorKey: temporary}];
+        return NO;
+    }
+    BOOL success = YES;
+    unsigned long long copied = 0;
+    NSTimeInterval lastProgressRefresh = 0;
+    unsigned char buffer[1024 * 1024];
+    for (;;) {
+        if (coordinator.cancelled) {
+            if (error) *error = ssbu_import_error(7, @"The import was stopped.");
+            success = NO;
+            break;
+        }
+        ssize_t count = read(input, buffer, sizeof buffer);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            int saved = errno;
+            if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+                userInfo:@{NSFilePathErrorKey: file.url.path ?: @""}];
+            success = NO;
+            break;
+        }
+        if (!count) break;
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(output, buffer + offset, (size_t)(count - offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                int saved = errno ? errno : EIO;
+                if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+                    userInfo:@{NSFilePathErrorKey: temporary}];
+                success = NO;
+                break;
+            }
+            offset += written;
+            copied += (unsigned long long)written;
+            coordinator.completedBytes += (unsigned long long)written;
+            NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+            if (now - lastProgressRefresh >= 0.5) {
+                lastProgressRefresh = now;
+                dispatch_async(dispatch_get_main_queue(), ^{ [coordinator refreshProgress]; });
+            }
+        }
+        if (!success) break;
+    }
+    if (success && copied != file.size) {
+        if (error) *error = ssbu_import_error(8, @"A game-data file changed while it was being copied.");
+        success = NO;
+    }
+    if (success && fsync(output) != 0) {
+        int saved = errno;
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+            userInfo:@{NSFilePathErrorKey: temporary}];
+        success = NO;
+    }
+    close(input);
+    if (close(output) != 0 && success) {
+        int saved = errno;
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+            userInfo:@{NSFilePathErrorKey: temporary}];
+        success = NO;
+    }
+    if (success && rename(temporary.fileSystemRepresentation, destination.fileSystemRepresentation) != 0) {
+        int saved = errno;
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:saved
+            userInfo:@{NSFilePathErrorKey: destination}];
+        success = NO;
+    }
+    if (!success) unlink(temporary.fileSystemRepresentation);
+    return success;
+}
+
+@implementation SSGameDataImportCoordinator
+
+- (UIViewController *)topController {
+    UIViewController *top = ui_window.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    return top;
+}
+
+- (void)presentPicker {
     if (!ui_window.rootViewController) return;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Add your game data"
-        message:@"This build has no bundled game data. In Files, copy the prepared dump/modules folder from your own Smash 13.0.5 setup into this app's Documents folder. Keep romfs.cfg, romfs.layers, the base NCA and romfs_patch.bin together. If available, copy dump/fonts too, then return here."
+    UIViewController *top = [self topController];
+    self.presenter = top;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    picker.shouldShowFileExtensions = YES;
+    picker.modalPresentationStyle = UIModalPresentationFormSheet;
+    [top presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *selected = urls.firstObject;
+    if (!selected) {
+        [self showImportError:ssbu_import_error(9, @"No folder was selected.")];
+        return;
+    }
+    [controller dismissViewControllerAnimated:YES completion:^{ [self beginImportFromURL:selected]; }];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    [controller dismissViewControllerAnimated:YES completion:^{
+        [self showImportError:ssbu_import_error(15, @"No folder was selected.")];
+    }];
+}
+
+- (void)showProgress {
+    self.completedBytes = 0;
+    self.progressAlert = [UIAlertController alertControllerWithTitle:@"Importing game data"
+        message:@"Checking the selected folder…" preferredStyle:UIAlertControllerStyleAlert];
+    __weak SSGameDataImportCoordinator *weakSelf = self;
+    [self.progressAlert addAction:[UIAlertAction actionWithTitle:@"Stop import" style:UIAlertActionStyleCancel
+        handler:^(UIAlertAction *action) { (void)action; weakSelf.cancelled = YES; }]];
+    UIViewController *top = [self topController];
+    if (top) [top presentViewController:self.progressAlert animated:YES completion:nil];
+}
+
+- (void)refreshProgress {
+    unsigned long long done = self.completedBytes;
+    unsigned long long total = self.totalBytes;
+    if (!self.progressAlert || !total) return;
+    double gib = 1024.0 * 1024.0 * 1024.0;
+    self.progressAlert.message = [NSString stringWithFormat:@"Copying game files…\n%.1f / %.1f GB", done / gib, total / gib];
+}
+
+- (void)beginImportFromURL:(NSURL *)selected {
+    self.cancelled = NO;
+    [self showProgress];
+    BOOL accessGranted = [selected startAccessingSecurityScopedResource];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        __block NSError *failure = nil;
+        __block BOOL success = NO;
+        NSFileCoordinator *fileCoordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+        [fileCoordinator coordinateReadingItemAtURL:selected options:NSFileCoordinatorReadingWithoutChanges
+            error:&failure byAccessor:^(NSURL *coordinatedURL) {
+                NSError *listingError = nil;
+                NSURL *sourceModules = ssbu_modules_folder(coordinatedURL);
+                if (!sourceModules) {
+                    failure = ssbu_import_error(10, @"Choose the extracted dump folder. It must contain a modules folder with romfs.cfg inside.");
+                    return;
+                }
+                unsigned long long total = 0;
+                NSArray<SSGameDataImportFile *> *files = ssbu_import_files(sourceModules, &total, &listingError);
+                if (!files) { failure = listingError; return; }
+                if (self.cancelled) {
+                    failure = ssbu_import_error(7, @"The import was stopped.");
+                    return;
+                }
+                self.totalBytes = total;
+                dispatch_async(dispatch_get_main_queue(), ^{ [self refreshProgress]; });
+                NSString *marker = game_data_import_marker();
+                NSData *markerData = [NSData dataWithBytes:"importing" length:9];
+                if (!marker || ![markerData writeToFile:marker atomically:YES]) {
+                    failure = ssbu_import_error(11, @"The app could not prepare its game-data folder. Check iPad storage and try again.");
+                    return;
+                }
+                atomic_store_explicit(&ssbu_import_in_progress, 1, memory_order_release);
+                NSString *destinationModules = module_directory();
+                if (!destinationModules) {
+                    [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
+                    atomic_store_explicit(&ssbu_import_in_progress, 0, memory_order_release);
+                    failure = ssbu_import_error(12, @"The app's Documents folder is unavailable.");
+                    return;
+                }
+                NSUInteger completedFiles = 0;
+                for (SSGameDataImportFile *file in files) {
+                    if (self.cancelled) {
+                        failure = ssbu_import_error(7, @"The import was stopped.");
+                        break;
+                    }
+                    NSString *destination = [destinationModules stringByAppendingPathComponent:file.relativePath];
+                    if (!ssbu_copy_import_file(file, destination, self, &failure)) break;
+                    completedFiles++;
+                }
+                if (failure) {
+                    if (!completedFiles) {
+                        [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
+                        atomic_store_explicit(&ssbu_import_in_progress, 0, memory_order_release);
+                    }
+                    return;
+                }
+                if (![[NSFileManager defaultManager] removeItemAtPath:marker error:&failure]) return;
+                atomic_store_explicit(&ssbu_import_in_progress, 0, memory_order_release);
+                if (!rebase_romfs_config()) {
+                    NSData *retryMarker = [NSData dataWithBytes:"retry" length:5];
+                    [retryMarker writeToFile:marker atomically:YES];
+                    atomic_store_explicit(&ssbu_import_in_progress, 1, memory_order_release);
+                    failure = ssbu_import_error(13, @"The files copied, but required game data is still missing. Choose the dump folder again and let the import finish.");
+                    return;
+                }
+                success = YES;
+            }];
+        if (accessGranted) [selected stopAccessingSecurityScopedResource];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *progress = self.progressAlert;
+            self.progressAlert = nil;
+            void (^finish)(void) = ^{
+                if (success) {
+                    ssbu_import_coordinator = nil;
+                } else {
+                    [self showImportError:failure ?: ssbu_import_error(14, @"The import could not be completed. Choose the dump folder again to retry.")];
+                }
+            };
+            if (progress.presentingViewController)
+                [progress dismissViewControllerAnimated:YES completion:finish];
+            else
+                finish();
+        });
+    });
+}
+
+- (void)showImportError:(NSError *)error {
+    NSString *message = error.localizedDescription ?: @"The import could not be completed.";
+    if ([error.domain isEqualToString:@"SSBUGameDataImport"] && error.code == 7)
+        message = @"Import paused. The partial copy cannot start the game. Choose the same dump folder again and let the import finish.";
+    else if ([error.domain isEqualToString:NSPOSIXErrorDomain] && error.code == ENOSPC)
+        message = @"There isn't enough free space on the iPad to finish copying the game data. Free up storage, then choose the dump folder again.";
+    else if ([error.domain isEqualToString:@"SSBUGameDataImport"] && error.code != 10 && error.code != 6)
+        message = [message stringByAppendingString:@" Choose the extracted dump folder again to retry."];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Game data wasn't imported"
+        message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Choose Folder" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *action) { (void)action; [self presentPicker]; }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+    UIViewController *top = [self topController];
+    if (top) [top presentViewController:alert animated:YES completion:nil];
+}
+
+@end
+
+void rt_window_ios_show_import_help(void) {
+    if (!ui_window.rootViewController || ssbu_import_coordinator) return;
+    ssbu_import_coordinator = [SSGameDataImportCoordinator new];
+    BOOL interrupted = [[NSFileManager defaultManager] fileExistsAtPath:game_data_import_marker() ?: @""];
+    NSString *message = interrupted
+        ? @"A previous import was interrupted. Choose the extracted dump folder again to complete it. The folder must contain modules/romfs.cfg. Keep the app open while the files copy; the game starts when they are ready."
+        : @"In Files, extract the separate game-data ZIP. Then choose its top-level dump folder (the one containing modules). The app copies the files here and starts the game when the import is complete.";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Import Smash game data"
+        message:message
         preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Choose dump folder" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *action) { (void)action; [ssbu_import_coordinator presentPicker]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+    a.preferredAction = a.actions.firstObject;
     [ui_window.rootViewController presentViewController:a animated:YES completion:nil];
 }
 
@@ -250,7 +663,9 @@ int rt_window_init(void) {
     CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     layer.colorspace = srgb;
     CGColorSpaceRelease(srgb);
-    layer.framebufferOnly = NO;
+    /* The normal present path only renders to the drawable. Let Core Animation optimize it
+     * for display; permit readback only when the optional window-capture diagnostic needs it. */
+    layer.framebufferOnly = !(getenv("SSBU_CAPTURE") && getenv("SSBU_CAPTURE_WINDOW"));
     layer.opaque = YES;
     ui_window = (__bridge UIWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(window),
                                                             SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);

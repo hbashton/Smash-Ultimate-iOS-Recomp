@@ -236,7 +236,7 @@ def link_and_bundle(bm, tc):
     filelist = bm.OUT / "ssbu.filelist"
     filelist.write_text("".join(str(o) + "\n" for o in objs), encoding="utf-8")
     partial = bm.OUT / "ssbu.partial"
-    frameworks = [arg for fw in ("SDL3", "Metal", "QuartzCore", "UIKit", "Foundation", "CoreFoundation",
+    frameworks = [arg for fw in ("SDL3", "Metal", "QuartzCore", "UIKit", "UniformTypeIdentifiers", "Foundation", "CoreFoundation",
                                  "CoreGraphics", "GameController", "AVFoundation", "AudioToolbox", "CoreHaptics")
                   for arg in ("-framework", fw)]
     print(f"linking {len(objs)} arm64 objects for iOS", flush=True)
