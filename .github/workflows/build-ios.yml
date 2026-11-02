@@ -121,7 +121,7 @@ jobs:
             echo "No matching private game-object cache; this run compiles the generated game once."
           fi
           mkdir -p "$RUNNER_TEMP/build/obj"
-          printf '%s\n' "$RUNNER_TEMP/port" > "$RUNNER_TEMP/build/obj/port.txt"
+          printf '%s\n' "$RUNNER_TEMP/port" > "$RUNNER_TEMP/build/port.txt"
 
       - name: Cross-compile for iPhone and iPad
         shell: bash
