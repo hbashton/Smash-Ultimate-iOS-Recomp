@@ -1,0 +1,182 @@
+name: Private iOS recompilation build
+
+on:
+  workflow_dispatch:
+    inputs:
+      transfer_url:
+        description: One-time HTTPS address from the local private transfer window
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    steps:
+      - name: Check out public source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Identify Xcode toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain_hash="$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "hash=$toolchain_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner space for the generated sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          developer_dir="$(xcode-select -p)"
+          case "$developer_dir" in
+            /Applications/*.app/Contents/Developer) ;;
+            *) echo "Selected Xcode path is outside the expected runner location"; exit 1 ;;
+          esac
+          for platform in iPhoneSimulator watchOS AppleTVSimulator XRSimulator; do
+            target="$developer_dir/Platforms/$platform.platform"
+            if [[ -d "$target" ]]; then rm -rf "$target"; fi
+          done
+          rm -rf "$HOME/Library/Developer/CoreSimulator"
+          df -h "$RUNNER_TEMP"
+
+      - name: Download and verify official SDL3 framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.dmg \
+            --output "$RUNNER_TEMP/SDL3.dmg"
+          echo "c1adf3da91108dbc3e4205da5dacebc203085d283fa89e86eb2c889abd03a853  $RUNNER_TEMP/SDL3.dmg" | shasum -a 256 --check
+          mkdir "$RUNNER_TEMP/sdl-mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/sdl-mount" "$RUNNER_TEMP/SDL3.dmg"
+          framework="$(find "$RUNNER_TEMP/sdl-mount" -name SDL3.xcframework -type d -print -quit)"
+          test -n "$framework"
+          ditto "$framework" "$RUNNER_TEMP/SDL3.xcframework"
+          hdiutil detach "$RUNNER_TEMP/sdl-mount"
+          rm -f "$RUNNER_TEMP/SDL3.dmg"
+
+      - name: Receive private generated game code
+        shell: bash
+        env:
+          TRANSFER_URL: ${{ inputs.transfer_url }}
+          BUILD_TRANSFER_TOKEN: ${{ secrets.BUILD_TRANSFER_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$BUILD_TRANSFER_TOKEN"
+          python tools/ios/transfer.py fetch \
+            --url "$TRANSFER_URL" \
+            --archive "$RUNNER_TEMP/recomp-payload.tar.gz" \
+            --extract-to "$RUNNER_TEMP/port"
+
+      - name: Fingerprint private compile inputs
+        id: inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_hash="$(python tools/ios/build_cache.py fingerprint \
+            --port "$RUNNER_TEMP/port" --repo "$GITHUB_WORKSPACE")"
+          echo "hash=$source_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore encrypted game-object cache
+        id: object-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/private-build-cache
+          key: ssbu-ios-objects-v1-${{ steps.toolchain.outputs.hash }}-${{ steps.inputs.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ssbu-ios-objects-v1-${{ steps.toolchain.outputs.hash }}-${{ steps.inputs.outputs.hash }}-
+
+      - name: Decrypt cached game objects privately
+        shell: bash
+        continue-on-error: true
+        env:
+          BUILD_TRANSFER_TOKEN: ${{ secrets.BUILD_TRANSFER_TOKEN }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/private-build-cache/game-objects.enc"
+          if [[ -s "$archive" && -s "$archive.meta" ]]; then
+            if python tools/ios/build_cache.py restore \
+              --archive "$archive" \
+              --out "$RUNNER_TEMP/build" \
+              --token-env BUILD_TRANSFER_TOKEN \
+              && find "$RUNNER_TEMP/build/obj" -name '*.o' -exec touch {} +; then
+              echo "Restored authenticated game objects; only platform runtime and link steps need rebuilding."
+            else
+              echo "Private object cache was invalid; continuing with a clean compile."
+              rm -rf "$RUNNER_TEMP/build/obj"
+            fi
+          else
+            echo "No matching private game-object cache; this run compiles the generated game once."
+          fi
+          mkdir -p "$RUNNER_TEMP/build/obj"
+          printf '%s\n' "$RUNNER_TEMP/port" > "$RUNNER_TEMP/build/obj/port.txt"
+
+      - name: Cross-compile for iPhone and iPad
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/ios/build_ios.py \
+            --port "$RUNNER_TEMP/port" \
+            --out "$RUNNER_TEMP/build" \
+            --sdl "$RUNNER_TEMP/SDL3.xcframework" \
+            --jobs 3 \
+            --preserve-objects
+
+      - name: Return the app bundle directly to the owner
+        shell: bash
+        env:
+          TRANSFER_URL: ${{ inputs.transfer_url }}
+          BUILD_TRANSFER_TOKEN: ${{ secrets.BUILD_TRANSFER_TOKEN }}
+        run: |
+          set -euo pipefail
+          python tools/ios/transfer.py upload \
+            --url "$TRANSFER_URL" \
+            --app "$RUNNER_TEMP/build/WindowSmash.app" \
+            --archive "$RUNNER_TEMP/ios-app-bundle.tar.gz"
+
+      - name: Prepare encrypted game-object cache
+        id: prepare-cache
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          BUILD_TRANSFER_TOKEN: ${{ secrets.BUILD_TRANSFER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -s "$RUNNER_TEMP/build/obj/game_sources.tsv" ]]; then
+            python tools/ios/build_cache.py pack \
+              --obj "$RUNNER_TEMP/build/obj" \
+              --archive "$RUNNER_TEMP/private-build-cache/game-objects.enc" \
+              --token-env BUILD_TRANSFER_TOKEN
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save encrypted game-object cache
+        if: always() && steps.prepare-cache.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/private-build-cache
+          key: ssbu-ios-objects-v1-${{ steps.toolchain.outputs.hash }}-${{ steps.inputs.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Remove private runner files
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          hdiutil detach "$RUNNER_TEMP/sdl-mount" >/dev/null 2>&1
+          rm -rf "$RUNNER_TEMP/port" "$RUNNER_TEMP/build" "$RUNNER_TEMP/SDL3.xcframework" \
+            "$RUNNER_TEMP/SDL3.dmg" "$RUNNER_TEMP/recomp-payload.tar.gz" \
+            "$RUNNER_TEMP/ios-app-bundle.tar.gz" "$RUNNER_TEMP/private-build-cache" "$RUNNER_TEMP/sdl-mount"

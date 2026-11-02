@@ -1,0 +1,5 @@
+# Core extraction dependency.
+pycryptodomex
+# arc.py reads zstd-compressed tables: Python 3.14 has compression.zstd built in, older
+# Pythons (3.10 to 3.13) get the zstandard package instead.
+zstandard; python_version < "3.14"

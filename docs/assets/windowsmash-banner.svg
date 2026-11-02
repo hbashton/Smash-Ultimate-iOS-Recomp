@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="260" viewBox="0 0 1280 260" role="img" aria-labelledby="title">
+  <title id="title">WindowSmash</title>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#111b2d"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="icon" x2="1" y2="1">
+      <stop stop-color="#82ddd7"/>
+      <stop offset="1" stop-color="#8da9db"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="260" rx="18" fill="url(#background)"/>
+  <g transform="translate(330 94)">
+    <rect width="72" height="72" rx="17" fill="#172637" stroke="#36535f"/>
+    <path d="M18 18H34V34H18ZM38 18H54V34H38ZM18 38H34V54H18ZM38 38H54V54H38Z" fill="url(#icon)"/>
+    <text x="100" y="56" font-family="Segoe UI,Arial,sans-serif" font-size="72" font-weight="650" letter-spacing="-2" fill="#edf2fa">Window<tspan fill="#82d8d2">Smash</tspan></text>
+  </g>
+</svg>

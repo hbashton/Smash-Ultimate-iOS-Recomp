@@ -1,0 +1,4 @@
+-r ../requirements.txt
+# Optional disassembly and game-backed differential testing tools.
+capstone
+unicorn

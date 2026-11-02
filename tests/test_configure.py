@@ -1,0 +1,73 @@
+from pathlib import Path
+import os
+import shutil
+import struct
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+PS = Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+FONTS = (
+    'nintendo_udsg-r_std_003.bfttf', 'nintendo_udsg-r_org_zh-cn_003.bfttf',
+    'nintendo_udsg-r_ext_zh-cn_003.bfttf', 'nintendo_udjxh-db_zh-tw_003.bfttf',
+    'nintendo_udsg-r_ko_003.bfttf', 'nintendo_ext_003.bfttf',
+)
+
+
+class ConfigureTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='configure-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+        self.install = self.folder / 'runtime with spaces'
+        (self.install / 'tools').mkdir(parents=True)
+        self.script = self.install / 'tools/Configure-Game-Data.ps1'
+        shutil.copyfile(ROOT / 'tools/Configure-Game-Data.ps1', self.script)
+        self.romfs = self.folder / 'romfs.bin'
+        self.romfs.write_bytes(struct.pack('<10Q', 80, 80, 0, 80, 0, 80, 0, 80, 0, 80) + b'fixture')
+        self.fonts = self.folder / 'my fonts'
+        self.fonts.mkdir()
+        for name in FONTS:
+            (self.fonts / name).write_bytes(b'font-fixture')
+        self.aoc = self.folder / 'aoc.cfg'
+        self.aoc.write_text('1\n')
+
+    def invoke(self, *args):
+        command = f"function Get-Process {{ @() }}; & '{self.script}' -NonInteractive -RomfsPath '{self.romfs}' -FontsDirectory '{self.fonts}' -AocConfig '{self.aoc}' " + ' '.join(args)
+        return subprocess.run([str(PS), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], capture_output=True, text=True)
+
+    def test_setup_and_backup(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        config = self.install / 'dump/modules/romfs.cfg'
+        self.assertEqual(config.read_text().splitlines(), [str(self.romfs), '0'])
+        self.assertEqual((self.install / 'dump/modules/aoc.cfg').read_bytes(), self.aoc.read_bytes())
+        for name in FONTS:
+            self.assertEqual((self.install / 'dump/fonts' / name).read_bytes(), b'font-fixture')
+        again = self.invoke()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        backups = list(config.parent.glob('romfs.cfg.before-setup-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), config.read_bytes())
+
+    def test_dry_run_writes_nothing(self):
+        result = self.invoke('-DryRun')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.install / 'dump').exists())
+
+    def test_bad_image_rejected(self):
+        self.romfs.write_bytes(bytes(100))
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.install / 'dump').exists())
+
+    def test_missing_font_rejected(self):
+        (self.fonts / FONTS[0]).unlink()
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.install / 'dump').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
