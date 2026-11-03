@@ -167,6 +167,14 @@ def zip_file(zf: zipfile.ZipFile, archive_name: str, source: Path) -> tuple[int,
     return total, crc & 0xFFFFFFFF
 
 
+def zip_directory(zf: zipfile.ZipFile, archive_name: str) -> None:
+    info = zipfile.ZipInfo(archive_name.rstrip("/") + "/")
+    info.create_system = 3
+    info.external_attr = (stat.S_IFDIR | 0o755) << 16
+    info.compress_type = zipfile.ZIP_STORED
+    zf.writestr(info, b"")
+
+
 def verify_bundle(app: Path) -> None:
     executable = app / "ssbu"
     framework = app / "Frameworks" / "SDL3.framework" / "SDL3"
@@ -185,37 +193,44 @@ def verify_bundle(app: Path) -> None:
         raise SystemExit("Info.plist is missing controller support declarations")
     if (app / "_CodeSignature").exists():
         raise SystemExit("the app must be signed after all local game assets are added")
+    if not (executable.stat().st_mode & 0o111):
+        raise SystemExit("the app executable is missing its executable permission")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", required=True, type=Path, help="built WindowSmash.app directory")
-    parser.add_argument("--game-data", required=True, type=Path, help="owner's prepared dump directory (contains modules/ and optionally fonts/)")
+    parser.add_argument("--game-data", type=Path, help="owner's prepared dump directory (contains modules/ and optionally fonts/)")
     parser.add_argument("--out", required=True, type=Path, help="destination IPA")
-    parser.add_argument("--game-data-out", required=True, type=Path, help="separate ZIP for importing game data from Files")
+    parser.add_argument("--game-data-out", type=Path, help="separate ZIP for importing game data from Files")
     args = parser.parse_args()
     app = args.app.resolve()
-    game_data = args.game_data.resolve()
+    game_data = args.game_data.resolve() if args.game_data is not None else None
     output = args.out.resolve()
-    game_output = args.game_data_out.resolve()
-    if not app.is_dir() or not game_data.is_dir():
-        raise SystemExit("app and prepared game-data directories must exist")
-    if output == game_output:
+    game_output = args.game_data_out.resolve() if args.game_data_out is not None else None
+    if not app.is_dir():
+        raise SystemExit("the built app directory must exist")
+    if (args.game_data is None) != (args.game_data_out is None):
+        raise SystemExit("--game-data and --game-data-out must be supplied together")
+    if game_data is not None and not game_data.is_dir():
+        raise SystemExit("the prepared game-data directory must exist")
+    if output == game_output and game_output is not None:
         raise SystemExit("the IPA and game-data archive must have different output paths")
     verify_bundle(app)
-    data_files = separate_game_data(game_data, app)
-    if output.exists() or game_output.exists():
+    data_files = separate_game_data(game_data, app) if game_data is not None else None
+    if output.exists() or (game_output is not None and game_output.exists()):
         raise SystemExit("an output already exists; choose new filenames for both files")
     output.parent.mkdir(parents=True, exist_ok=True)
-    game_output.parent.mkdir(parents=True, exist_ok=True)
+    if game_output is not None:
+        game_output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial")
     partial.unlink(missing_ok=True)
     total = 0
     source_crc: dict[str, tuple[int, int]] = {}
     try:
         with zipfile.ZipFile(partial, "w", allowZip64=True) as zf:
-            zf.writestr("Payload/", b"")
-            zf.writestr("Payload/WindowSmash.app/", b"")
+            zip_directory(zf, "Payload/")
+            zip_directory(zf, "Payload/WindowSmash.app/")
             files = list(app_files(app))
             for index, (relative, source) in enumerate(files, 1):
                 size, crc = zip_file(zf, f"Payload/WindowSmash.app/{relative}", source)
@@ -227,6 +242,8 @@ def main() -> int:
             bad = zf.testzip()
             if bad:
                 raise OSError(f"IPA checksum failed: {bad}")
+            if "Payload/" not in zf.namelist() or "Payload/WindowSmash.app/" not in zf.namelist():
+                raise OSError("IPA is missing explicit Payload directory entries")
             for name, (size, crc) in source_crc.items():
                 item = zf.getinfo(name)
                 if item.file_size != size or item.CRC != crc:
@@ -234,19 +251,25 @@ def main() -> int:
             info = plistlib.loads(zf.read("Payload/WindowSmash.app/Info.plist"))
             if info.get("GCSupportsControllerUserInteraction") is not True:
                 raise OSError("controller capability was lost from the packaged IPA")
+            executable_info = zf.getinfo("Payload/WindowSmash.app/ssbu")
+            if not ((executable_info.external_attr >> 16) & 0o111):
+                raise OSError("the IPA executable is missing its executable permission")
             bundled_user_data = [name for name in zf.namelist()
                                  if name.startswith("Payload/WindowSmash.app/Resources/dump/")
                                  and "/modules/" in name and not name.endswith(".reloc.bin")]
             if bundled_user_data:
                 raise OSError("game data was unexpectedly included in the small IPA")
-        write_game_data_archive(game_output, data_files)
+        if game_output is not None and data_files is not None:
+            write_game_data_archive(game_output, data_files)
         os.replace(partial, output)
     except Exception:
         partial.unlink(missing_ok=True)
-        game_output.unlink(missing_ok=True)
+        if game_output is not None:
+            game_output.unlink(missing_ok=True)
         raise
     print(f"Small IPA ready: {output} ({output.stat().st_size / 1_000_000_000:.2f} GB; unsigned)", flush=True)
-    print(f"Game data ready: {game_output} ({game_output.stat().st_size / 1_000_000_000:.2f} GB; never sent to the build runner)", flush=True)
+    if game_output is not None:
+        print(f"Game data ready: {game_output} ({game_output.stat().st_size / 1_000_000_000:.2f} GB; never sent to the build runner)", flush=True)
     return 0
 
 

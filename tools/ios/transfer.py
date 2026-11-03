@@ -328,20 +328,34 @@ def fetch(args) -> None:
 
 def upload(args) -> None:
     token = read_token(args)
-    app = Path(args.app).resolve()
-    archive = Path(args.archive).resolve()
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive, "w:gz", compresslevel=1, format=tarfile.PAX_FORMAT) as tf:
-        tf.add(app, arcname=app.name, recursive=True)
-    size = archive.stat().st_size
+    if args.file:
+        source = Path(args.file).resolve()
+        if not source.is_file():
+            raise SystemExit("the IPA file does not exist")
+        if args.archive:
+            raise SystemExit("--archive is only used when transferring an app bundle")
+        is_ipa = True
+    else:
+        app = Path(args.app).resolve()
+        if not app.is_dir():
+            raise SystemExit("the app bundle directory does not exist")
+        if not args.archive:
+            raise SystemExit("--archive is required when transferring an app bundle")
+        archive = Path(args.archive).resolve()
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "w:gz", compresslevel=1, format=tarfile.PAX_FORMAT) as tf:
+            tf.add(app, arcname=app.name, recursive=True)
+        source = archive
+        is_ipa = False
+    size = source.stat().st_size
     count = (size + CHUNK_LIMIT - 1) // CHUNK_LIMIT
     if count > 512:
-        raise SystemExit("built app bundle is too large for the private transfer")
+        raise SystemExit("the build output is too large for the private transfer")
     base = validate_transfer_url(args.url) + "/upload"
     digest = hashlib.sha256()
-    with archive.open("rb") as source:
+    with source.open("rb") as stream:
         for index in range(count):
-            data = source.read(CHUNK_LIMIT)
+            data = stream.read(CHUNK_LIMIT)
             chunk_hash = hashlib.sha256(data).hexdigest()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream",
                        "Content-Length": str(len(data)), "X-Chunk-Index": str(index),
@@ -360,8 +374,10 @@ def upload(args) -> None:
             if last_error:
                 raise SystemExit(f"private app transfer failed at chunk {index + 1}/{count}: {last_error}")
             digest.update(data)
-            print(f"Private app bundle transfer: {index + 1}/{count} chunks", flush=True)
-    print(f"Private app bundle sent ({size / 1_000_000_000:.2f} GB; sha256={digest.hexdigest()}).", flush=True)
+            description = "IPA" if is_ipa else "app bundle"
+            print(f"Private {description} transfer: {index + 1}/{count} chunks", flush=True)
+    description = "IPA" if is_ipa else "app bundle"
+    print(f"Private {description} sent ({size / 1_000_000_000:.2f} GB; sha256={digest.hexdigest()}).", flush=True)
 
 
 def main() -> None:
@@ -385,8 +401,10 @@ def main() -> None:
     post = sub.add_parser("upload")
     post.add_argument("--url", required=True)
     post.add_argument("--token-env", default="BUILD_TRANSFER_TOKEN")
-    post.add_argument("--app", required=True)
-    post.add_argument("--archive", required=True)
+    source = post.add_mutually_exclusive_group(required=True)
+    source.add_argument("--app")
+    source.add_argument("--file", help="send one file directly without a temporary archive")
+    post.add_argument("--archive", help="temporary tar.gz path used only with --app")
     args = parser.parse_args()
     if args.mode == "prepare-payload":
         create_payload(args.port, args.archive)

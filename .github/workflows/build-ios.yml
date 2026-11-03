@@ -134,7 +134,15 @@ jobs:
             --jobs 4 \
             --preserve-objects
 
-      - name: Return the app bundle directly to the owner
+      - name: Package and verify the unsigned iOS IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/ios/package_ipa.py \
+            --app "$RUNNER_TEMP/build/WindowSmash.app" \
+            --out "$RUNNER_TEMP/WindowSmash.ipa"
+
+      - name: Return the IPA directly to the owner
         shell: bash
         env:
           TRANSFER_URL: ${{ inputs.transfer_url }}
@@ -143,8 +151,7 @@ jobs:
           set -euo pipefail
           python tools/ios/transfer.py upload \
             --url "$TRANSFER_URL" \
-            --app "$RUNNER_TEMP/build/WindowSmash.app" \
-            --archive "$RUNNER_TEMP/ios-app-bundle.tar.gz"
+            --file "$RUNNER_TEMP/WindowSmash.ipa"
 
       - name: Prepare encrypted game-object cache
         id: prepare-cache
@@ -179,4 +186,5 @@ jobs:
           hdiutil detach "$RUNNER_TEMP/sdl-mount" >/dev/null 2>&1
           rm -rf "$RUNNER_TEMP/port" "$RUNNER_TEMP/build" "$RUNNER_TEMP/SDL3.xcframework" \
             "$RUNNER_TEMP/SDL3.dmg" "$RUNNER_TEMP/recomp-payload.tar.gz" \
-            "$RUNNER_TEMP/ios-app-bundle.tar.gz" "$RUNNER_TEMP/private-build-cache" "$RUNNER_TEMP/sdl-mount"
+            "$RUNNER_TEMP/ios-app-bundle.tar.gz" "$RUNNER_TEMP/WindowSmash.ipa" \
+            "$RUNNER_TEMP/private-build-cache" "$RUNNER_TEMP/sdl-mount"
