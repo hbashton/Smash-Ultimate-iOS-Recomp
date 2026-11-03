@@ -280,9 +280,10 @@ def main() -> int:
                 raise OSError("the IPA executable is missing its executable permission")
             if executable_info.compress_type != zipfile.ZIP_DEFLATED:
                 raise OSError("the IPA executable must use standard DEFLATE compression")
-            bundled_user_data = [name for name in zf.namelist()
-                                 if name.startswith("Payload/WindowSmash.app/Resources/dump/")
-                                 and "/modules/" in name and not name.endswith(".reloc.bin")]
+            bundled_user_data = [item.filename for item in zf.infolist()
+                                 if item.filename.startswith("Payload/WindowSmash.app/Resources/dump/")
+                                 and "/modules/" in item.filename and not item.is_dir()
+                                 and not item.filename.endswith(".reloc.bin")]
             if bundled_user_data:
                 raise OSError("game data was unexpectedly included in the small IPA")
         if game_output is not None and data_files is not None:
