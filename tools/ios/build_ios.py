@@ -303,8 +303,9 @@ def main():
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--preserve-objects", action="store_true", help="keep generated game objects for a private incremental cache")
     args = parser.parse_args()
-    if args.jobs < 1 or args.jobs > 3:
-        raise SystemExit("jobs must be between 1 and 3 on the hosted runner")
+    maximum_jobs = os.cpu_count() or 1
+    if args.jobs < 1 or args.jobs > maximum_jobs:
+        raise SystemExit(f"jobs must be between 1 and {maximum_jobs} on this runner")
     tc, bm = configure(args)
     bm.OUT.mkdir(parents=True, exist_ok=True)
     if not bm.modules():
