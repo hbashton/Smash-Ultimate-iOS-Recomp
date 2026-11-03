@@ -138,14 +138,20 @@ def write_game_data_archive(output: Path, files: dict[str, Path]) -> None:
         raise
 
 
-def zip_file(zf: zipfile.ZipFile, archive_name: str, source: Path) -> tuple[int, int]:
+def zip_file(
+    zf: zipfile.ZipFile,
+    archive_name: str,
+    source: Path,
+    *,
+    compression: int = zipfile.ZIP_STORED,
+) -> tuple[int, int]:
     st = source.lstat()
     if stat.S_ISLNK(st.st_mode):
         data = os.readlink(source).encode("utf-8")
         info = zipfile.ZipInfo(archive_name)
         info.create_system = 3
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
-        info.compress_type = zipfile.ZIP_STORED
+        info.compress_type = compression
         info.file_size = len(data)
         zf.writestr(info, data)
         return len(data), zlib.crc32(data)
@@ -154,7 +160,7 @@ def zip_file(zf: zipfile.ZipFile, archive_name: str, source: Path) -> tuple[int,
     info.create_system = 3
     info.external_attr = (stat.S_IFREG | (st.st_mode & 0o777)) << 16
     info.file_size = st.st_size
-    info.compress_type = zipfile.ZIP_STORED
+    info.compress_type = compression
     crc = 0
     total = 0
     with source.open("rb") as src, zf.open(info, "w", force_zip64=True) as dest:
@@ -228,12 +234,23 @@ def main() -> int:
     total = 0
     source_crc: dict[str, tuple[int, int]] = {}
     try:
-        with zipfile.ZipFile(partial, "w", allowZip64=True) as zf:
+        with zipfile.ZipFile(
+            partial,
+            "w",
+            allowZip64=True,
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=3,
+        ) as zf:
             zip_directory(zf, "Payload/")
             zip_directory(zf, "Payload/WindowSmash.app/")
             files = list(app_files(app))
             for index, (relative, source) in enumerate(files, 1):
-                size, crc = zip_file(zf, f"Payload/WindowSmash.app/{relative}", source)
+                size, crc = zip_file(
+                    zf,
+                    f"Payload/WindowSmash.app/{relative}",
+                    source,
+                    compression=zipfile.ZIP_DEFLATED,
+                )
                 source_crc[f"Payload/WindowSmash.app/{relative}"] = (size, crc)
                 total += size
                 if index % 100 == 0 or index == len(files):
@@ -254,6 +271,8 @@ def main() -> int:
             executable_info = zf.getinfo("Payload/WindowSmash.app/ssbu")
             if not ((executable_info.external_attr >> 16) & 0o111):
                 raise OSError("the IPA executable is missing its executable permission")
+            if executable_info.compress_type != zipfile.ZIP_DEFLATED:
+                raise OSError("the IPA executable must use standard DEFLATE compression")
             bundled_user_data = [name for name in zf.namelist()
                                  if name.startswith("Payload/WindowSmash.app/Resources/dump/")
                                  and "/modules/" in name and not name.endswith(".reloc.bin")]
