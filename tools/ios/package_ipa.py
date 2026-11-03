@@ -265,6 +265,9 @@ def main() -> int:
                 raise OSError(f"IPA checksum failed: {bad}")
             if "Payload/" not in zf.namelist() or "Payload/WindowSmash.app/" not in zf.namelist():
                 raise OSError("IPA is missing explicit Payload directory entries")
+            for item in zf.infolist():
+                if item.file_size < zipfile.ZIP64_LIMIT and item.extract_version >= 45:
+                    raise OSError(f"IPA entry unnecessarily requires Zip64: {item.filename}")
             for name, (size, crc) in source_crc.items():
                 item = zf.getinfo(name)
                 if item.file_size != size or item.CRC != crc:
