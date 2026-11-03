@@ -110,6 +110,7 @@ jobs:
             if python tools/ios/build_cache.py restore \
               --archive "$archive" \
               --out "$RUNNER_TEMP/build" \
+              --port "$RUNNER_TEMP/port" \
               --token-env BUILD_TRANSFER_TOKEN \
               && find "$RUNNER_TEMP/build/obj" -name '*.o' -exec touch {} +; then
               echo "Restored authenticated game objects; only platform runtime and link steps need rebuilding."

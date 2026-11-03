@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -178,9 +179,62 @@ def safe_extract(archive: Path, staging: Path) -> None:
         tf.extractall(root, members=members, filter="data")
 
 
+def refresh_cached_game_objects(port: Path, obj: Path) -> int:
+    """Rebase cached object records to the current extraction's source mtimes.
+
+    The cache key already authenticates the full generated-source contents and all
+    compile headers. A fresh runner can extract identical source files with newer
+    mtimes, though, which makes build_mac.py reject otherwise valid cached objects.
+    Refresh its size/mtime records and object mtimes after the authenticated cache
+    has been restored, so the normal incremental checks can safely reuse them.
+    """
+    record = obj / "game_sources.tsv"
+    if not record.is_file():
+        raise SystemExit("cached game-object source record is missing")
+    source_root = port / "build"
+    repo_root = Path(__file__).resolve().parents[2]
+    header_paths = [repo_root / "runtime" / "recomp.h", repo_root / "runtime" / "module.h"]
+    header_mtime_ns = max((path.stat().st_mtime_ns for path in header_paths if path.is_file()), default=0)
+    lines = record.read_text(encoding="utf-8").splitlines()
+    if not lines or not lines[0].startswith("# "):
+        raise SystemExit("cached game-object compile record has no command header")
+
+    refreshed = [lines[0]]
+    count = 0
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 5:
+            raise SystemExit("cached game-object compile record is malformed")
+        key = fields[0]
+        parts = key.split("/")
+        if "\\" in key or not parts or parts[0] not in {"main", "subsdk0", "sdk", "nro"} \
+                or any(part in ("", ".", "..") for part in parts):
+            raise SystemExit("cached game-object compile record contains an unsafe path")
+        relative = Path(*parts)
+        source = source_root / relative.with_suffix(".c")
+        cached_object = obj / relative
+        if not source.is_file() or not cached_object.is_file():
+            continue
+
+        stat = source.stat()
+        fields[3] = str(stat.st_size)
+        fields[4] = str(int(stat.st_mtime))
+        refreshed.append("\t".join(fields))
+
+        object_stat = cached_object.stat()
+        object_mtime_ns = max(object_stat.st_mtime_ns, stat.st_mtime_ns, header_mtime_ns,
+                              time.time_ns()) + 1_000_000
+        os.utime(cached_object, ns=(object_stat.st_atime_ns, object_mtime_ns))
+        count += 1
+
+    record.write_text("\n".join(refreshed) + "\n", encoding="utf-8")
+    return count
+
+
 def restore(args: argparse.Namespace) -> None:
     archive = Path(args.archive).resolve()
     out = Path(args.out).resolve()
+    port = Path(args.port).resolve()
     obj = out / "obj"
     if obj.exists():
         raise SystemExit("object-cache destination already exists")
@@ -205,8 +259,11 @@ def restore(args: argparse.Namespace) -> None:
         staged_obj = staging / "obj"
         if not (staged_obj / "game_sources.tsv").is_file() or not generated_objects(staged_obj):
             raise SystemExit("decrypted game-object cache is incomplete")
+        reused = refresh_cached_game_objects(port, staged_obj)
+        if not reused:
+            raise SystemExit("decrypted cache has no objects matching the current generated game")
         shutil.move(str(staged_obj), str(obj))
-    print("Authenticated encrypted cache restored; generated game objects are ready for incremental linking.")
+    print(f"Authenticated encrypted cache restored; refreshed {reused} generated game-object records for incremental linking.")
 
 
 def main() -> int:
@@ -222,6 +279,7 @@ def main() -> int:
     rs = subs.add_parser("restore")
     rs.add_argument("--archive", required=True)
     rs.add_argument("--out", required=True)
+    rs.add_argument("--port", required=True, help="current generated source tree used to rebase cache timestamps")
     rs.add_argument("--token-env", default="BUILD_TRANSFER_TOKEN")
     args = parser.parse_args()
     if args.command == "fingerprint":
