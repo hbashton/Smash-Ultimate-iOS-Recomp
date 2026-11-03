@@ -163,7 +163,11 @@ def zip_file(
     info.compress_type = compression
     crc = 0
     total = 0
-    with source.open("rb") as src, zf.open(info, "w", force_zip64=True) as dest:
+    # Most iOS app files, including the 1 GB recomp executable, fit in classic ZIP
+    # headers. Only force Zip64 for a single entry when its declared size needs it;
+    # unnecessary Zip64 local headers confuse some third-party IPA signing tools.
+    force_zip64 = st.st_size >= zipfile.ZIP64_LIMIT
+    with source.open("rb") as src, zf.open(info, "w", force_zip64=force_zip64) as dest:
         while block := src.read(BLOCK):
             dest.write(block)
             crc = zlib.crc32(block, crc)
