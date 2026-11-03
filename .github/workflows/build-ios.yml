@@ -131,7 +131,7 @@ jobs:
             --port "$RUNNER_TEMP/port" \
             --out "$RUNNER_TEMP/build" \
             --sdl "$RUNNER_TEMP/SDL3.xcframework" \
-            --jobs 3 \
+            --jobs 4 \
             --preserve-objects
 
       - name: Return the app bundle directly to the owner
